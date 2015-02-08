@@ -37,6 +37,7 @@
 #include <linux/tcp.h>
 #include <linux/pkt_sched.h>
 #include <linux/ipv6.h>
+#include <linux/time.h>
 #ifdef NETIF_F_TSO
 #include <net/checksum.h>
 #ifdef NETIF_F_TSO6
@@ -2574,55 +2575,75 @@ enum latency_range {
  *      this functionality is controlled by the InterruptThrottleRate module
  *      parameter (see ixgbe_param.c)
  **/
+
+/* throttling at 1GBPS / 10GBPS link speed: 953 int/s - 488K int/s */
+#define MAXIRQ 100000
+#define MINIRQ 8000
+#define MAXPACKETS 2000
 static void ixgbe_update_itr(struct ixgbe_q_vector *q_vector,
 			     struct ixgbe_ring_container *ring_container)
 {
-	int bytes = ring_container->total_bytes;
-	int packets = ring_container->total_packets;
-	u32 timepassed_us;
-	u64 bytes_perint;
-	u8 itr_setting = ring_container->itr;
+	unsigned int packets = ring_container->total_packets;
+	u64 packets_permsec;
+	u64 itr_setting;
+	static struct timespec last_print = {0,0};
 
-	if (packets == 0)
+	if (packets == 0) {
 		return;
-
-	/* simple throttlerate management
-	 *   0-10MB/s   lowest (100000 ints/s)
-	 *  10-20MB/s   low    (20000 ints/s)
-	 *  20-1249MB/s bulk   (8000 ints/s)
-	 */
-	/* what was last interrupt timeslice? */
-	timepassed_us = q_vector->itr >> 2;
-	if (timepassed_us == 0)
-		return;
-	bytes_perint = bytes / timepassed_us; /* bytes/usec */
-
-	switch (itr_setting) {
-	case lowest_latency:
-		if (bytes_perint > 10) {
-			itr_setting = low_latency;
-		}
-		break;
-	case low_latency:
-		if (bytes_perint > 20) {
-			itr_setting = bulk_latency;
-		} else if (bytes_perint <= 10) {
-			itr_setting = lowest_latency;
-		}
-		break;
-	case bulk_latency:
-		if (bytes_perint <= 20) {
-			itr_setting = low_latency;
-		}
-		break;
 	}
 
+	struct timespec time_now = {0,0};
+	getrawmonotonic(&time_now);
+	struct timespec time_passed;
+
+	time_passed.tv_sec = time_now.tv_sec - ring_container->last_update.tv_sec;
+	time_passed.tv_nsec = time_now.tv_nsec - ring_container->last_update.tv_nsec;
+	if (time_passed.tv_nsec < 0) {
+		--time_passed.tv_sec;
+		time_passed.tv_nsec += 1000000000L;
+	}
+
+	//50us minimum wait between itr adaptation
+	if (time_passed.tv_sec < 1 && time_passed.tv_nsec < 50000) {
+		return;
+	}
+
+	packets_permsec = (u64)packets * 1000000 / time_passed.tv_nsec;
+/*
+	//offset packets
+	//200 packets per ms = 0.2mpps
+	if (packets_permsec < 200) {
+		packets_permsec = 0;
+	} else {
+		packets_permsec -= 200;
+	}
+*/
+	//cap packets
+	if (packets_permsec > MAXPACKETS) {
+		packets_permsec = MAXPACKETS;
+	}
+
+	itr_setting = MAXIRQ - (packets_permsec * (MAXIRQ - MINIRQ) / MAXPACKETS);
+
+	/* write updated itr to ring container */
+	if (itr_setting != ring_container->itr) {
+		//printk(KERN_INFO "ixgbe: %d usecs passed, %d packets per msec, ITR set to %d\n", ring_container->total_us, packets_permsec, itr_setting);
+		ring_container->itr = (4000000 / itr_setting);
+
+		if (time_now.tv_sec - last_print.tv_sec >= 1) {
+
+			printk(KERN_INFO "ixgbe: seen %u packets since %ld ns ago (%llu packets per msec), IRQs set to %llu\n", packets, time_passed.tv_nsec, packets_permsec, itr_setting);
+
+			last_print.tv_sec = time_now.tv_sec;
+			last_print.tv_nsec = last_print.tv_nsec;
+		}
+	}
+	
 	/* clear work counters since we have the values we need */
 	ring_container->total_bytes = 0;
 	ring_container->total_packets = 0;
-
-	/* write updated itr to ring container */
-	ring_container->itr = itr_setting;
+	ring_container->last_update.tv_sec = time_now.tv_sec;
+	ring_container->last_update.tv_nsec = time_now.tv_nsec;
 }
 
 /**
@@ -2661,37 +2682,17 @@ void ixgbe_write_eitr(struct ixgbe_q_vector *q_vector)
 
 static void ixgbe_set_itr(struct ixgbe_q_vector *q_vector)
 {
-	u32 new_itr = q_vector->itr;
-	u8 current_itr;
+	u16 new_itr;
+	u16 current_itr = q_vector->itr;
 
 	ixgbe_update_itr(q_vector, &q_vector->tx);
 	ixgbe_update_itr(q_vector, &q_vector->rx);
 
-	current_itr = max(q_vector->rx.itr, q_vector->tx.itr);
+	new_itr = max(q_vector->rx.itr, q_vector->tx.itr);
 
-	switch (current_itr) {
-	/* counts and packets in update_itr are dependent on these numbers */
-	case lowest_latency:
-		new_itr = IXGBE_100K_ITR;
-		break;
-	case low_latency:
-		new_itr = IXGBE_20K_ITR;
-		break;
-	case bulk_latency:
-		new_itr = IXGBE_8K_ITR;
-		break;
-	default:
-		break;
-	}
-
-	if (new_itr != q_vector->itr) {
-		/* do an exponential smoothing */
-		new_itr = (10 * new_itr * q_vector->itr) /
-			  ((9 * new_itr) + q_vector->itr);
-
-		/* save the algorithm value here */
+	if (current_itr != new_itr) {
+	
 		q_vector->itr = new_itr;
-
 		ixgbe_write_eitr(q_vector);
 	}
 }

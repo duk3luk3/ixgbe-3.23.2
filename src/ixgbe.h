@@ -34,6 +34,7 @@
 #include <linux/pci.h>
 #include <linux/netdevice.h>
 #include <linux/vmalloc.h>
+#include <linux/time.h>
 
 #ifdef SIOCETHTOOL
 #include <linux/ethtool.h>
@@ -484,10 +485,11 @@ static inline unsigned int ixgbe_rx_pg_order(struct ixgbe_ring __maybe_unused *r
 struct ixgbe_ring_container {
 	struct ixgbe_ring *ring;	/* pointer to linked list of rings */
 	unsigned int total_bytes;	/* total bytes processed this int */
+	struct timespec last_update;
 	unsigned int total_packets;	/* total packets processed this int */
 	u16 work_limit;			/* total work allowed per interrupt */
 	u8 count;			/* total number of rings in vector */
-	u8 itr;				/* current ITR setting for ring */
+	u16 itr;			/* current ITR setting for ring */
 };
 
 /* iterator for handling rings in ring container */
